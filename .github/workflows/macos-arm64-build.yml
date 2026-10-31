@@ -1,0 +1,163 @@
+
+name: Package ParticleNetwork macOS Apple Silicon DMG
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package-mac-arm64:
+    runs-on: macos-15
+
+    steps:
+      # STEP 1 - Download and extract prebuilt files
+      - name: Download and extract ARM64 build
+        shell: bash
+        env:
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p build/input
+
+          gh release download v1.0.0 \
+            --repo "$GH_REPOSITORY" \
+            --pattern "ParticleNetwork-macOS-build-input.zip" \
+            --dir build
+
+          python3 - <<'PY'
+          from pathlib import Path, PurePosixPath
+          from shutil import copyfileobj
+          from zipfile import ZipFile
+
+          archive = Path("build/ParticleNetwork-macOS-build-input.zip")
+          destination_root = Path("build/input")
+
+          with ZipFile(archive) as z:
+              for entry in z.infolist():
+                  name = entry.filename.replace("\\", "/")
+                  path = PurePosixPath(name)
+
+                  if path.is_absolute() or ".." in path.parts:
+                      raise ValueError(f"Unsafe ZIP path: {name}")
+
+                  target = destination_root.joinpath(*path.parts)
+
+                  if entry.is_dir() or name.endswith("/"):
+                      target.mkdir(parents=True, exist_ok=True)
+                  else:
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      with z.open(entry) as source:
+                          with target.open("wb") as output:
+                              copyfileobj(source, output)
+          PY
+
+          test -f build/input/publish/ParticleNetwork
+          test -f build/input/Info.plist
+          test -f build/input/PNLogo.png
+
+          plutil -lint build/input/Info.plist
+
+          echo "Extraction successful!"
+
+      # STEP 2 - Verify ARM64 architecture
+      - name: Verify Apple Silicon architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          file build/input/publish/ParticleNetwork
+
+          lipo -archs build/input/publish/ParticleNetwork
+
+          lipo build/input/publish/ParticleNetwork -verify_arch arm64
+
+          echo "ARM64 architecture verified!"
+
+      # STEP 3 - Generate macOS icon
+      - name: Create PNLogo.icns
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p build/PNLogo.iconset
+
+          for size in 16 32 128 256 512; do
+            sips -s format png -z "$size" "$size" \
+              build/input/PNLogo.png \
+              --out "build/PNLogo.iconset/icon_${size}x${size}.png" >/dev/null
+
+            doubled=$((size * 2))
+
+            sips -s format png -z "$doubled" "$doubled" \
+              build/input/PNLogo.png \
+              --out "build/PNLogo.iconset/icon_${size}x${size}@2x.png" >/dev/null
+          done
+
+          iconutil -c icns \
+            build/PNLogo.iconset \
+            -o build/PNLogo.icns
+
+          echo "PNLogo.icns created!"
+
+      # STEP 4 - Build application bundle
+      - name: Create ParticleNetwork.app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP="build/ParticleNetwork.app"
+
+          mkdir -p "$APP/Contents/MacOS"
+          mkdir -p "$APP/Contents/Resources"
+
+          cp -R build/input/publish/. "$APP/Contents/MacOS/"
+          cp build/input/Info.plist "$APP/Contents/Info.plist"
+          cp build/PNLogo.icns "$APP/Contents/Resources/PNLogo.icns"
+
+          chmod +x "$APP/Contents/MacOS/ParticleNetwork"
+
+          plutil -lint "$APP/Contents/Info.plist"
+
+          echo "Signing application..."
+
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep "$APP"
+
+          echo "ParticleNetwork.app created!"
+
+      # STEP 5 - Package DMG
+      - name: Create Apple Silicon DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p build/dmg-content
+          mkdir -p build/output
+
+          ditto \
+            build/ParticleNetwork.app \
+            build/dmg-content/ParticleNetwork.app
+
+          ln -s /Applications build/dmg-content/Applications
+
+          hdiutil create \
+            -volname "ParticleNetwork" \
+            -srcfolder build/dmg-content \
+            -format UDZO \
+            -ov \
+            build/output/ParticleNetwork-v1.0.0-macOS-AppleSilicon.dmg
+
+          echo "DMG created successfully!"
+
+      # STEP 6 - Upload finished DMG
+      - name: Upload Apple Silicon DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: ParticleNetwork-macOS-AppleSilicon-DMG
+          path: build/output/*.dmg
+          if-no-files-found: error
+          retention-days: 30
